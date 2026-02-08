@@ -14,7 +14,7 @@ from layer2_text import run_layer2
 from layer3_backboard import run_layer3, initialize_assistants
 
 
-async def run_full_pipeline(audio_path: str, groq_client: Groq) -> dict:
+async def run_full_pipeline(audio_path: str, groq_client: Groq, language: str | None = None) -> dict:
     """
     Execute the full 3-layer analysis pipeline on an audio file.
 
@@ -25,7 +25,7 @@ async def run_full_pipeline(audio_path: str, groq_client: Groq) -> dict:
     start_time = datetime.now()
 
     # ── Layer 1: Audio Forensics ──────────────────────────────────────
-    layer1 = run_layer1(audio_path, groq_client)
+    layer1 = run_layer1(audio_path, groq_client, language=language)
     transcript = layer1["transcript"]
 
     if not transcript or not transcript.strip():
@@ -36,7 +36,8 @@ async def run_full_pipeline(audio_path: str, groq_client: Groq) -> dict:
         }
 
     # ── Layer 2: Text Processing ──────────────────────────────────────
-    layer2 = run_layer2(transcript)
+    detected_lang = layer1.get("language", "en")
+    layer2 = run_layer2(transcript, language=detected_lang)
 
     # ── Layer 3: Backboard Intelligence ───────────────────────────────
     layer3 = await run_layer3(transcript, layer2)
@@ -52,10 +53,13 @@ async def run_full_pipeline(audio_path: str, groq_client: Groq) -> dict:
 
         # Layer 1
         "transcript": transcript,
-        "language": layer1["language"],
+        "language": detected_lang,
         "duration_seconds": layer1["duration"],
         "segments": layer1["segments"],
         "audio_quality": layer1["audio_quality"],
+        "overall_confidence": layer1.get("overall_confidence"),
+        "emotion_analysis": layer1.get("emotion_analysis"),
+        "tamper_detection": layer1.get("tamper_detection"),
 
         # Layer 2
         "pii_detected": layer2["pii_detected"],
@@ -72,24 +76,43 @@ async def run_full_pipeline(audio_path: str, groq_client: Groq) -> dict:
         "regulatory_compliance": layer3["regulatory_compliance"],
 
         # Overall
-        "overall_risk": _compute_overall_risk(layer2, layer3),
+        "overall_risk": _compute_overall_risk(layer1, layer2, layer3),
     }
 
     return report
 
 
-def _compute_overall_risk(layer2: dict, layer3: dict) -> dict:
-    """Compute overall risk score from layers 2 and 3."""
+def _compute_overall_risk(layer1: dict, layer2: dict, layer3: dict) -> dict:
+    """Compute overall risk score from all layers."""
     risk_factors = []
     score = 100  # Start at 100, deduct for issues
 
-    # PII risk
+    # ── Tamper risk (Layer 1) ──
+    tamper = layer1.get("tamper_detection", {})
+    if isinstance(tamper, dict) and tamper.get("tamper_detected"):
+        flags = tamper.get("tampering_flags", [])
+        risk_factors.append(f"Audio integrity concern: {len(flags)} tampering indicator(s)")
+        score -= len(flags) * 10
+
+    # ── Confidence risk (Layer 1) ──
+    confidence = layer1.get("overall_confidence")
+    if isinstance(confidence, (int, float)) and confidence < 0.5:
+        risk_factors.append(f"Low transcription confidence ({confidence:.1%})")
+        score -= 10
+
+    # ── Emotion / stress risk (Layer 1) ──
+    emotion = layer1.get("emotion_analysis", {})
+    if isinstance(emotion, dict) and emotion.get("overall_stress") == "high":
+        risk_factors.append("High stress detected in call")
+        score -= 5
+
+    # ── PII risk (Layer 2) ──
     pii_count = layer2.get("pii_count", 0)
     if pii_count > 0:
         risk_factors.append(f"{pii_count} PII item(s) exposed in conversation")
         score -= min(pii_count * 5, 20)
 
-    # Profanity risk
+    # ── Profanity risk (Layer 2) ──
     profanity = layer2.get("profanity_findings", [])
     high_severity = [p for p in profanity if p.get("severity") == "high"]
     if high_severity:
@@ -100,7 +123,7 @@ def _compute_overall_risk(layer2: dict, layer3: dict) -> dict:
         risk_factors.append("Profanity used in call")
         score -= 10
 
-    # Compliance from Layer 3
+    # ── Compliance from Layer 3 ──
     compliance = layer3.get("regulatory_compliance", {})
     if isinstance(compliance, dict):
         violations = compliance.get("violations", [])
@@ -111,7 +134,6 @@ def _compute_overall_risk(layer2: dict, layer3: dict) -> dict:
 
         comp_score = compliance.get("compliance_score")
         if isinstance(comp_score, (int, float)):
-            # weight Backboard compliance score
             score = int(score * 0.4 + comp_score * 0.6)
 
     score = max(score, 0)

@@ -250,12 +250,17 @@ async def run_layer3(transcript: str, layer2_data: dict) -> dict:
     if not _state["initialized"]:
         await initialize_assistants()
 
-    # Run all three assistants concurrently
-    obligation_result, intent_result, compliance_result = await asyncio.gather(
+    # Run all three assistants concurrently (don't crash if one fails)
+    results = await asyncio.gather(
         detect_obligations(transcript, layer2_data),
         classify_intent(transcript),
         check_regulatory_compliance(transcript, layer2_data),
+        return_exceptions=True,
     )
+
+    obligation_result = results[0] if not isinstance(results[0], Exception) else f"Error: {results[0]}"
+    intent_result = results[1] if not isinstance(results[1], Exception) else f"Error: {results[1]}"
+    compliance_result = results[2] if not isinstance(results[2], Exception) else f"Error: {results[2]}"
 
     return {
         "layer": "backboard_intelligence",

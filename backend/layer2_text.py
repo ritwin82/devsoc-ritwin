@@ -14,9 +14,10 @@ from pathlib import Path
 nlp = spacy.load("en_core_web_sm")
 
 # ---------------------------------------------------------------------------
-# PII PATTERNS
+# PII PATTERNS — Multilingual
 # ---------------------------------------------------------------------------
 PII_PATTERNS = {
+    # English / International
     "phone": re.compile(
         r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"
     ),
@@ -36,7 +37,20 @@ PII_PATTERNS = {
         r"\b[A-Z]{5}\d{4}[A-Z]\b"
     ),
     "account_number": re.compile(
-        r"\b\d{9,18}\b"
+        r"\b(?:a/?c|account)\s*(?:no\.?|number|#)?\s*:?\s*\d{9,18}\b", re.IGNORECASE
+    ),
+    # Russian
+    "phone_ru": re.compile(
+        r"\+?7[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{2}[-.\s]?\d{2}"
+    ),
+    "passport_ru": re.compile(
+        r"\b\d{4}\s?\d{6}\b"
+    ),
+    "inn_ru": re.compile(
+        r"\b\d{10}(?:\d{2})?\b"
+    ),
+    "snils_ru": re.compile(
+        r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{3}[-.\s]?\d{2}\b"
     ),
 }
 
@@ -45,21 +59,29 @@ PII_PATTERNS = {
 # ---------------------------------------------------------------------------
 FINANCIAL_PATTERNS = {
     "currency_amount": re.compile(
-        r"(?:(?:Rs\.?|INR|USD|\$|₹)\s*\d[\d,]*(?:\.\d{1,2})?)"
-        r"|(?:\d[\d,]*(?:\.\d{1,2})?\s*(?:rupees|dollars|lakhs?|crores?|thousand|hundred))",
+        r"(?:(?:Rs\.?|INR|USD|\$|€|£|₹)\s*\d[\d,]*(?:\.\d{1,2})?)"
+        r"|(?:\d[\d,]*(?:\.\d{1,2})?\s*(?:rupees|dollars|euros|pounds|lakhs?|crores?|thousand|hundred))",
+        re.IGNORECASE,
+    ),
+    "currency_rub": re.compile(
+        r"(?:\d[\d\s,]*(?:[.,]\d{1,2})?\s*(?:рублей|руб\.?|₽))"
+        r"|(?:\d[\d\s,]*(?:[.,]\d{1,2})?\s*(?:тысяч|миллион(?:ов|а)?|млн)\s*(?:рублей|долларов|евро)?)"
+        r"|(?:\d[\d\s,]*(?:[.,]\d{1,2})?\s*(?:долларов|евро))",
         re.IGNORECASE,
     ),
     "percentage": re.compile(
-        r"\b\d+(?:\.\d+)?\s*(?:%|percent|per\s*cent)\b", re.IGNORECASE
+        r"\b\d+(?:[.,]\d+)?\s*(?:%|percent|per\s*cent|процент(?:ов|а)?)\b", re.IGNORECASE
     ),
     "date_reference": re.compile(
         r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
         r"|(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s*\d{2,4})"
-        r"|(?:\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4})",
+        r"|(?:\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4})"
+        r"|(?:\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s*\d{2,4}?)",
         re.IGNORECASE,
     ),
     "loan_term": re.compile(
-        r"\b\d+\s*(?:months?|years?|days?|EMI|installments?)\b", re.IGNORECASE
+        r"\b\d+\s*(?:months?|years?|days?|EMI|installments?|месяц(?:ев|а)?|лет|год(?:а|ов)?|дней|дня)\b",
+        re.IGNORECASE,
     ),
 }
 
@@ -87,12 +109,20 @@ PROHIBITED_PHRASES = [
 # OBLIGATION KEYWORDS
 # ---------------------------------------------------------------------------
 OBLIGATION_KEYWORDS = [
+    # English
     "must", "shall", "required", "mandatory", "obligated",
     "need to", "have to", "should", "will be charged",
     "agree to", "consent", "acknowledge", "confirm",
     "i promise", "we guarantee", "committed to",
     "by signing", "terms and conditions", "cooling off",
     "within 30 days", "penalty", "fee", "interest rate",
+    # Russian
+    "должен", "обязан", "необходимо", "обещаю", "гарантирую",
+    "подтверждаю", "согласен", "обязательно", "штраф", "комиссия",
+    "процент", "условия", "договор", "контракт",
+    "в течение", "обязуюсь", "ответственность",
+    # Hindi
+    "ज़रूरी", "अनिवार्य", "वादा", "सहमत", "शर्तें",
 ]
 
 
@@ -170,14 +200,19 @@ def detect_profanity(text: str) -> list[dict]:
 
 
 def extract_obligations(text: str) -> list[dict]:
-    """Extract sentences containing obligation keywords."""
+    """Extract sentences containing obligation keywords (word-boundary matching)."""
     doc = nlp(text)
     obligations = []
-    text_lower = text.lower()
 
     for sent in doc.sents:
         sent_lower = sent.text.lower()
-        matched_keywords = [kw for kw in OBLIGATION_KEYWORDS if kw in sent_lower]
+        matched_keywords = []
+        for kw in OBLIGATION_KEYWORDS:
+            # Use word-boundary regex to avoid substring matches
+            # e.g. prevent "продолжение" from matching "должен"
+            pattern = r'(?<!\w)' + re.escape(kw) + r'(?!\w)'
+            if re.search(pattern, sent_lower):
+                matched_keywords.append(kw)
         if matched_keywords:
             obligations.append({
                 "sentence": sent.text.strip(),
@@ -200,11 +235,15 @@ def load_policy_rules(policy_dir: str = "../data/policies") -> dict:
     return rules
 
 
-def run_layer2(transcript: str) -> dict:
+def run_layer2(transcript: str, language: str = "en") -> dict:
     """Run complete Layer 2 pipeline on transcript text."""
     pii = detect_pii(transcript)
     financial_entities = extract_financial_entities(transcript)
-    spacy_entities = extract_spacy_entities(transcript)
+    # spaCy NER — only run on English (en_core_web_sm)
+    if language.lower().startswith("en"):
+        spacy_entities = extract_spacy_entities(transcript)
+    else:
+        spacy_entities = []  # spaCy en model not applicable for non-English
     profanity = detect_profanity(transcript)
     obligations = extract_obligations(transcript)
 

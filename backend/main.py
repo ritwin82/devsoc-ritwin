@@ -29,7 +29,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -101,7 +101,7 @@ async def upload_audio(file: UploadFile = File(...)):
 # ── Layer 1 only: Transcribe + Quality ─────────────────────────────────────
 
 @app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
+async def transcribe_endpoint(file: UploadFile = File(...)):
     """Layer 1 only: Transcribe audio + audio quality analysis."""
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTS:
@@ -141,10 +141,11 @@ async def analyze_text(body: dict):
 # ── Full Pipeline: Audio → L1 → L2 → L3 ──────────────────────────────────
 
 @app.post("/analyze")
-async def full_analysis(file: UploadFile = File(...)):
+async def full_analysis(file: UploadFile = File(...), language: str | None = None):
     """
     FULL PIPELINE: Upload audio → Layer 1 → Layer 2 → Layer 3.
     Returns complete compliance report.
+    Optionally specify language (e.g. 'en', 'ru', 'hi') to improve accuracy.
     """
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTS:
@@ -158,7 +159,7 @@ async def full_analysis(file: UploadFile = File(...)):
         with open(dst, "wb") as buf:
             shutil.copyfileobj(file.file, buf)
 
-        report = await run_full_pipeline(str(dst), groq_client)
+        report = await run_full_pipeline(str(dst), groq_client, language=language)
 
         # Save report
         report_path = await save_report(report)
