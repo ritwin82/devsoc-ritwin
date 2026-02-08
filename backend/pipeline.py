@@ -1,0 +1,144 @@
+"""
+Pipeline Orchestrator
+Chains Layer 1 → Layer 2 → Layer 3 and produces final report.
+"""
+
+import asyncio
+import json
+from datetime import datetime
+from pathlib import Path
+from groq import Groq
+
+from layer1_audio import run_layer1
+from layer2_text import run_layer2
+from layer3_backboard import run_layer3, initialize_assistants
+
+
+async def run_full_pipeline(audio_path: str, groq_client: Groq) -> dict:
+    """
+    Execute the full 3-layer analysis pipeline on an audio file.
+
+    Layer 1: Audio Forensics  (Groq Whisper + Librosa)
+    Layer 2: Text Processing  (spaCy + Regex + PII)
+    Layer 3: Intelligence     (Backboard assistants)
+    """
+    start_time = datetime.now()
+
+    # ── Layer 1: Audio Forensics ──────────────────────────────────────
+    layer1 = run_layer1(audio_path, groq_client)
+    transcript = layer1["transcript"]
+
+    if not transcript or not transcript.strip():
+        return {
+            "status": "error",
+            "error": "Transcription returned empty — audio may be silent or corrupted.",
+            "audio_quality": layer1.get("audio_quality"),
+        }
+
+    # ── Layer 2: Text Processing ──────────────────────────────────────
+    layer2 = run_layer2(transcript)
+
+    # ── Layer 3: Backboard Intelligence ───────────────────────────────
+    layer3 = await run_layer3(transcript, layer2)
+
+    elapsed = (datetime.now() - start_time).total_seconds()
+
+    # ── Assemble final report ─────────────────────────────────────────
+    report = {
+        "status": "success",
+        "processed_at": start_time.isoformat(),
+        "processing_time_seconds": round(elapsed, 2),
+        "audio_file": Path(audio_path).name,
+
+        # Layer 1
+        "transcript": transcript,
+        "language": layer1["language"],
+        "duration_seconds": layer1["duration"],
+        "segments": layer1["segments"],
+        "audio_quality": layer1["audio_quality"],
+
+        # Layer 2
+        "pii_detected": layer2["pii_detected"],
+        "pii_count": layer2["pii_count"],
+        "financial_entities": layer2["financial_entities"],
+        "named_entities": layer2["named_entities"],
+        "profanity_findings": layer2["profanity_findings"],
+        "obligation_sentences": layer2["obligation_sentences"],
+        "text_risk_level": layer2["risk_level"],
+
+        # Layer 3
+        "obligation_analysis": layer3["obligation_analysis"],
+        "intent_classification": layer3["intent_classification"],
+        "regulatory_compliance": layer3["regulatory_compliance"],
+
+        # Overall
+        "overall_risk": _compute_overall_risk(layer2, layer3),
+    }
+
+    return report
+
+
+def _compute_overall_risk(layer2: dict, layer3: dict) -> dict:
+    """Compute overall risk score from layers 2 and 3."""
+    risk_factors = []
+    score = 100  # Start at 100, deduct for issues
+
+    # PII risk
+    pii_count = layer2.get("pii_count", 0)
+    if pii_count > 0:
+        risk_factors.append(f"{pii_count} PII item(s) exposed in conversation")
+        score -= min(pii_count * 5, 20)
+
+    # Profanity risk
+    profanity = layer2.get("profanity_findings", [])
+    high_severity = [p for p in profanity if p.get("severity") == "high"]
+    if high_severity:
+        risk_factors.append(f"{len(high_severity)} prohibited phrase(s) detected")
+        score -= len(high_severity) * 15
+
+    if any(p.get("type") == "profanity" for p in profanity):
+        risk_factors.append("Profanity used in call")
+        score -= 10
+
+    # Compliance from Layer 3
+    compliance = layer3.get("regulatory_compliance", {})
+    if isinstance(compliance, dict):
+        violations = compliance.get("violations", [])
+        critical = [v for v in violations if v.get("severity") == "critical"]
+        if critical:
+            risk_factors.append(f"{len(critical)} critical regulation violation(s)")
+            score -= len(critical) * 20
+
+        comp_score = compliance.get("compliance_score")
+        if isinstance(comp_score, (int, float)):
+            # weight Backboard compliance score
+            score = int(score * 0.4 + comp_score * 0.6)
+
+    score = max(score, 0)
+
+    if score >= 80:
+        level = "low"
+    elif score >= 50:
+        level = "medium"
+    else:
+        level = "high"
+
+    return {
+        "score": score,
+        "level": level,
+        "risk_factors": risk_factors,
+    }
+
+
+async def save_report(report: dict, output_dir: str = "../data/outputs") -> str:
+    """Save report as JSON file."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    filepath = out / filename
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, default=str, ensure_ascii=False)
+
+    return str(filepath)

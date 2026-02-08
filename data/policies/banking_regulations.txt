@@ -1,0 +1,22 @@
+BANKING CALL REGULATIONS
+
+
+2. INFORMATION DISCLOSURE
+   - Never ask for full OTP or CVV
+   - Never ask for complete card number
+   - Never ask for full password
+
+3. MANDATORY DISCLOSURES
+   - Interest rates must be clearly stated
+   - All fees and charges must be disclosed
+   - Cooling-off period must be mentioned for new products
+
+4. COLLECTION CALLS
+   - Cannot threaten legal action falsely
+   - Cannot call before 8 AM or after 9 PM
+   - Must identify themselves clearly
+   - Cannot use abusive language
+
+5. KYC VERIFICATION
+   - Must verify: DOB, address, last 4 digits of account
+   - Must not share customer details with third parties
