@@ -14,8 +14,10 @@ import os
 import asyncio
 import time
 from pathlib import Path
+from typing import Optional
 from backboard import BackboardClient
 from finbert_extractor import run_finbert_analysis, prepare_terms_for_explanation
+from memory_layer import get_memory_manager, generate_session_id
 
 BACKBOARD_API_KEY = os.getenv("BACKBOARD_API_KEY", "")
 
@@ -191,6 +193,8 @@ async def _send_to_assistant(
     content: str,
     model_name: str = "gpt-4o",
     llm_provider: str = "openai",
+    session_id: Optional[str] = None,
+    caller_id: Optional[str] = None,
 ) -> str:
     """Send a message to a specific assistant and get the response."""
     client = await _get_client()
@@ -199,13 +203,33 @@ async def _send_to_assistant(
         await initialize_assistants()
 
     assistant_id = _state["assistant_ids"][assistant_key]
+    
+    # Get memory manager for context-aware threading
+    memory_manager = await get_memory_manager()
+    
+    # Use persistent thread if session provided, otherwise fresh thread
+    thread_id = await memory_manager.get_or_create_thread(
+        assistant_id=assistant_id,
+        session_id=session_id,
+        caller_id=caller_id,
+        use_persistent=(session_id is not None)
+    )
+    
+    # Enrich content with caller context if available
+    enriched_content = content
+    if caller_id:
+        caller_context = await memory_manager.get_caller_context(caller_id)
+        if caller_context:
+            enriched_content = f"""CALLER HISTORY:
+{caller_context}
 
-    # Create a fresh thread for each analysis to avoid context pollution
-    thread = await client.create_thread(assistant_id)
+---
+
+{content}"""
 
     response = await client.add_message(
-        thread_id=thread.thread_id,
-        content=content,
+        thread_id=thread_id,
+        content=enriched_content,
         memory="Auto",
         stream=False,
         llm_provider=llm_provider,
@@ -215,7 +239,12 @@ async def _send_to_assistant(
     return response.content
 
 
-async def detect_obligations(transcript: str, layer2_data: dict) -> str:
+async def detect_obligations(
+    transcript: str, 
+    layer2_data: dict,
+    session_id: Optional[str] = None,
+    caller_id: Optional[str] = None
+) -> str:
     """Assistant 1: Detect obligations in the transcript."""
     prompt = f"""Analyze the following financial services call transcript for obligations and commitments.
 
@@ -227,10 +256,17 @@ PRE-EXTRACTED OBLIGATION SENTENCES:
 
 Provide your analysis in the specified JSON format."""
 
-    return await _send_to_assistant("obligation_detector", prompt)
+    return await _send_to_assistant(
+        "obligation_detector", prompt,
+        session_id=session_id, caller_id=caller_id
+    )
 
 
-async def classify_intent(transcript: str) -> str:
+async def classify_intent(
+    transcript: str,
+    session_id: Optional[str] = None,
+    caller_id: Optional[str] = None
+) -> str:
     """Assistant 2: Classify call intent and sentiment."""
     prompt = f"""Analyze the following financial services call transcript.
 
@@ -239,10 +275,18 @@ TRANSCRIPT:
 
 Provide your intent/sentiment analysis in the specified JSON format."""
 
-    return await _send_to_assistant("intent_classifier", prompt)
+    return await _send_to_assistant(
+        "intent_classifier", prompt,
+        session_id=session_id, caller_id=caller_id
+    )
 
 
-async def check_regulatory_compliance(transcript: str, layer2_data: dict) -> str:
+async def check_regulatory_compliance(
+    transcript: str, 
+    layer2_data: dict,
+    session_id: Optional[str] = None,
+    caller_id: Optional[str] = None
+) -> str:
     """Assistant 3: Check regulatory compliance using RAG on uploaded policies."""
     prompt = f"""Perform a regulatory compliance audit on the following financial services call.
 
@@ -263,7 +307,10 @@ Financial Entities Found:
 Check against the uploaded banking regulations and prohibited phrases documents.
 Provide your compliance audit in the specified JSON format."""
 
-    return await _send_to_assistant("regulatory_checker", prompt)
+    return await _send_to_assistant(
+        "regulatory_checker", prompt,
+        session_id=session_id, caller_id=caller_id
+    )
 
 
 async def explain_financial_terms(terms: list[str]) -> str:
@@ -284,10 +331,22 @@ Respond in the specified JSON format."""
     return await _send_to_assistant("financial_term_explainer", prompt)
 
 
-async def run_layer3(transcript: str, layer2_data: dict) -> dict:
+async def run_layer3(
+    transcript: str, 
+    layer2_data: dict,
+    session_id: Optional[str] = None,
+    caller_id: Optional[str] = None
+) -> dict:
     """
     Run all 4 Backboard assistants in parallel plus FinBERT analysis.
     
+    Args:
+        transcript: The call transcript text
+        layer2_data: Results from Layer 2 text processing
+        session_id: Optional session ID for thread persistence
+        caller_id: Optional caller ID for context enrichment
+    
+    Pipeline:
     1. FinBERT: Identify important segments and extract financial terms
     2. Obligation Detector: Find commitments and promises
     3. Intent Classifier: Classify call intent/sentiment
@@ -297,6 +356,13 @@ async def run_layer3(transcript: str, layer2_data: dict) -> dict:
     # Initialize if needed
     if not _state["initialized"]:
         await initialize_assistants()
+    
+    # Initialize memory manager and create session if not provided
+    memory_manager = await get_memory_manager()
+    if not session_id:
+        session_id = generate_session_id()
+    
+    await memory_manager.create_session(session_id, caller_id)
 
     # Step 1: Run FinBERT analysis (sync, CPU-based)
     try:
@@ -309,9 +375,9 @@ async def run_layer3(transcript: str, layer2_data: dict) -> dict:
 
     # Step 2: Run all four assistants concurrently (don't crash if one fails)
     results = await asyncio.gather(
-        detect_obligations(transcript, layer2_data),
-        classify_intent(transcript),
-        check_regulatory_compliance(transcript, layer2_data),
+        detect_obligations(transcript, layer2_data, session_id, caller_id),
+        classify_intent(transcript, session_id, caller_id),
+        check_regulatory_compliance(transcript, layer2_data, session_id, caller_id),
         explain_financial_terms(financial_terms),
         return_exceptions=True,
     )
@@ -321,8 +387,38 @@ async def run_layer3(transcript: str, layer2_data: dict) -> dict:
     compliance_result = results[2] if not isinstance(results[2], Exception) else f"Error: {results[2]}"
     term_explanation_result = results[3] if not isinstance(results[3], Exception) else f"Error: {results[3]}"
 
+    # Store call summary in memory for future context
+    if caller_id:
+        intent_data = _try_parse_json(intent_result)
+        compliance_data = _try_parse_json(compliance_result)
+        obligation_data = _try_parse_json(obligation_result)
+        
+        # Derive risk level from compliance score
+        compliance_score = compliance_data.get("compliance_score") if isinstance(compliance_data, dict) else None
+        if compliance_score is not None:
+            if compliance_score >= 80:
+                risk_level = "low"
+            elif compliance_score >= 50:
+                risk_level = "medium"
+            else:
+                risk_level = "high"
+        else:
+            risk_level = "unknown"
+        
+        await memory_manager.store_call_summary(caller_id, {
+            "intent": intent_data.get("primary_intent") if isinstance(intent_data, dict) else None,
+            "sentiment": intent_data.get("customer_sentiment") if isinstance(intent_data, dict) else None,
+            "compliance_score": compliance_score,
+            "overall_compliance": compliance_data.get("overall_compliance") if isinstance(compliance_data, dict) else None,
+            "risk_level": risk_level,
+            "violations_count": len(compliance_data.get("violations", [])) if isinstance(compliance_data, dict) else 0,
+            "obligations_count": len(obligation_data.get("obligations", [])) if isinstance(obligation_data, dict) else 0,
+        })
+
     return {
         "layer": "backboard_intelligence",
+        "session_id": session_id,
+        "caller_id": caller_id,
         "finbert_analysis": finbert_result,
         "obligation_analysis": _try_parse_json(obligation_result),
         "intent_classification": _try_parse_json(intent_result),

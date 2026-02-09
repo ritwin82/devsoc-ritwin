@@ -20,6 +20,7 @@ from layer3_backboard import initialize_assistants, run_layer3
 from finbert_extractor import run_finbert_analysis, prepare_terms_for_explanation
 from pipeline import run_full_pipeline, save_report, _compute_overall_risk
 from realtime import handle_realtime_websocket
+from memory_layer import get_memory_manager, generate_session_id
 
 # Load environment variables
 load_dotenv()
@@ -188,10 +189,21 @@ def _sse(event_type: str, stage: str, message: str) -> str:
 # ── Full Pipeline: Audio → L1 → L2 → L3 (SSE streaming) ──────────────────
 
 @app.post("/analyze")
-async def full_analysis(file: UploadFile = File(...), language: str | None = None):
+async def full_analysis(
+    file: UploadFile = File(...), 
+    language: str | None = None,
+    caller_id: str | None = None,
+    session_id: str | None = None
+):
     """
-    FULL PIPELINE with progress streaming via Server-Sent Events.
-    Each layer emits progress events; the final event contains the full report.
+    FULL PIPELINE: Upload audio → Layer 1 → Layer 2 → Layer 3.
+    Returns complete compliance report with memory context.
+    
+    Args:
+        file: Audio file to analyze
+        language: Optional language hint (e.g. 'en', 'ru', 'hi')
+        caller_id: Optional caller identifier for memory persistence across calls
+        session_id: Optional session ID for grouping related analyses
     """
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTS:
@@ -201,8 +213,21 @@ async def full_analysis(file: UploadFile = File(...), language: str | None = Non
     safe_name = f"{timestamp_str}_{file.filename}"
     dst = UPLOAD_DIR / safe_name
 
-    with open(dst, "wb") as buf:
-        shutil.copyfileobj(file.file, buf)
+    try:
+        with open(dst, "wb") as buf:
+            shutil.copyfileobj(file.file, buf)
+
+        report = await run_full_pipeline(
+            str(dst), groq_client, language,
+            caller_id=caller_id,
+            session_id=session_id
+        )
+
+        # Save report
+        report_path = await save_report(report)
+        report["report_path"] = report_path
+
+        return report
 
     async def event_stream():
         try:
@@ -294,6 +319,74 @@ def get_policies():
     """Return loaded policy documents."""
     rules = load_policy_rules()
     return {"policies": rules}
+
+
+# ── Memory Management Endpoints ───────────────────────────────────────────
+
+@app.get("/memory/caller/{caller_id}")
+async def get_caller_memory(caller_id: str):
+    """
+    Get memory/history for a specific caller.
+    Returns call history and patterns associated with the caller.
+    """
+    memory_manager = await get_memory_manager()
+    history = await memory_manager.get_caller_history(caller_id)
+    context = await memory_manager.get_caller_context(caller_id)
+    
+    return {
+        "caller_id": caller_id,
+        "call_count": len(history),
+        "call_history": history,
+        "context_summary": context,
+    }
+
+
+@app.get("/memory/session/{session_id}")
+async def get_session_memory(session_id: str):
+    """
+    Get current session context.
+    Returns context data accumulated during an analysis session.
+    """
+    memory_manager = await get_memory_manager()
+    context = await memory_manager.get_session_context(session_id)
+    
+    return {
+        "session_id": session_id,
+        "context": context,
+        "exists": bool(context),
+    }
+
+
+@app.delete("/memory/caller/{caller_id}")
+async def clear_caller_memory(caller_id: str):
+    """
+    Clear all memory for a caller (GDPR compliance).
+    This permanently removes all stored history for the specified caller.
+    """
+    memory_manager = await get_memory_manager()
+    success = await memory_manager.clear_caller_memory(caller_id)
+    
+    return {
+        "caller_id": caller_id,
+        "cleared": success,
+        "message": "All caller memory has been deleted." if success else "No memory found for this caller.",
+    }
+
+
+@app.get("/memory/status")
+async def memory_status():
+    """
+    Get memory system status.
+    Returns counts of active sessions and tracked callers.
+    """
+    memory_manager = await get_memory_manager()
+    
+    return {
+        "status": "active",
+        "active_sessions": len(memory_manager._sessions),
+        "tracked_callers": len(memory_manager._caller_memories),
+        "pattern_types": list(memory_manager._pattern_memory.keys()),
+    }
 
 
 # ── List saved reports ─────────────────────────────────────────────────────
