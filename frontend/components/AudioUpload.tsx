@@ -11,6 +11,8 @@ interface AudioUploadProps {
 export default function AudioUpload({ onAnalyzed }: AudioUploadProps) {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
+  const [language, setLanguage] = useState<string>("auto");
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -38,11 +40,15 @@ export default function AudioUpload({ onAnalyzed }: AudioUploadProps) {
 
     setLoading(true);
     setMessage(null);
+    setProgress("Uploading audio file...");
 
     try {
-      const result = await analyzeAudio(file);
+      const result = await analyzeAudio(file, language, (msg, stage) => {
+        setProgress(msg);
+      });
 
       if (result) {
+        setProgress(null);
         setMessage({
           type: "success",
           text: `✓ Successfully analyzed: ${result.filename}`,
@@ -59,19 +65,23 @@ export default function AudioUpload({ onAnalyzed }: AudioUploadProps) {
           setMessage(null);
         }, 3000);
       } else {
+        setProgress(null);
         setMessage({
           type: "error",
-          text: "Failed to analyze audio. Please try again.",
+          text: "Analysis returned no result. Try selecting the correct language above.",
         });
       }
-    } catch (error) {
+    } catch (error: any) {
+      setProgress(null);
+      const errMsg = error?.message || "Error uploading file. Please check your backend connection.";
       setMessage({
         type: "error",
-        text: "Error uploading file. Please check your backend connection.",
+        text: errMsg,
       });
       console.error("Upload error:", error);
     } finally {
       setLoading(false);
+      setProgress(null);
     }
   };
 
@@ -112,6 +122,28 @@ export default function AudioUpload({ onAnalyzed }: AudioUploadProps) {
           MP3, WAV, M4A, OGG, FLAC, WebM up to 100MB
         </p>
 
+        {/* Language selector */}
+        <div className="mt-4 flex items-center justify-center gap-2">
+          <label className="text-sm text-gray-400">Language:</label>
+          <select
+            value={language}
+            onChange={(e) => setLanguage(e.target.value)}
+            disabled={loading}
+            className="bg-gray-800 border border-gray-600 rounded px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-blue-500"
+          >
+            <option value="auto">Auto-detect</option>
+            <option value="en">English</option>
+            <option value="hi">Hindi</option>
+            <option value="ru">Russian</option>
+            <option value="es">Spanish</option>
+            <option value="fr">French</option>
+            <option value="de">German</option>
+            <option value="zh">Chinese</option>
+            <option value="ja">Japanese</option>
+            <option value="ar">Arabic</option>
+          </select>
+        </div>
+
         {file && (
           <div className="mt-4">
             <p className="text-gray-300 font-medium">Selected: {file.name}</p>
@@ -121,6 +153,16 @@ export default function AudioUpload({ onAnalyzed }: AudioUploadProps) {
           </div>
         )}
       </div>
+
+      {/* Progress indicator */}
+      {loading && progress && (
+        <div className="mt-4 p-3 rounded-lg bg-blue-900/20 border border-blue-700">
+          <div className="flex items-center gap-3">
+            <div className="animate-spin h-4 w-4 border-2 border-blue-400 border-t-transparent rounded-full flex-shrink-0" />
+            <span className="text-blue-200 text-sm">{progress}</span>
+          </div>
+        </div>
+      )}
 
       {/* Message */}
       {message && (

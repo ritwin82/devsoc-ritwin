@@ -8,6 +8,8 @@ requests==2.31.0
 
 librosa==0.10.1
 soundfile==0.12.1
+imageio-ffmpeg>=0.5.1
+pydub>=0.25.1
 
 spacy==3.7.4
 numpy==1.26.4
@@ -19,6 +21,7 @@ backboard-sdk
 transformers>=4.36.0
 torch>=2.0.0
 sentencepiece>=0.1.99
-
+elevenlabs
+python-dotenv
 # Memory management
 psutil>=5.9.0

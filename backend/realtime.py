@@ -157,6 +157,27 @@ class RealtimeSession:
             print(f"  Transcription error: {e}")
             return ""
 
+    # ── Fraud / social-engineering keyword lists ────────────────────
+    FRAUD_PHRASES = [
+        "access to your computer", "access to ur computer",
+        "remote access", "remote desktop", "teamviewer", "anydesk",
+        "give me your password", "share your password", "tell me your pin",
+        "send me money", "wire transfer now", "transfer funds immediately",
+        "commit fraud", "commit a fraud", "launder money", "money laundering",
+        "insider trading", "ponzi", "pyramid scheme",
+        "gift card", "buy gift cards", "pay with gift cards",
+        "do not tell anyone", "keep this secret", "don't tell your bank",
+        "act now or else", "your account will be closed",
+        "irs is suing you", "warrant for your arrest",
+        "i am from the bank", "i am calling from microsoft",
+        "social security number has been compromised",
+        "verify your identity by sharing",
+    ]
+    FRAUD_KEYWORDS = [
+        "fraud", "scam", "phishing", "extortion", "blackmail",
+        "ransomware", "identity theft", "embezzlement",
+    ]
+
     def _run_l2_checks(self, text: str) -> list[dict]:
         """Run Layer 2 checks on new text and return alerts."""
         alerts = []
@@ -181,6 +202,27 @@ class RealtimeSession:
                 "severity": p["severity"],
                 "message": f"{'Prohibited phrase' if p['type'] == 'prohibited_phrase' else 'Profanity'}: \"{p['value']}\"",
                 "timestamp": timestamp,
+            })
+
+        # Fraud / social-engineering detection
+        text_lower = text.lower()
+        matched_phrases = [p for p in self.FRAUD_PHRASES if p in text_lower]
+        matched_keywords = [k for k in self.FRAUD_KEYWORDS if k in text_lower.split() or k in text_lower]
+        if matched_phrases:
+            alerts.append({
+                "type": "social_engineering",
+                "severity": "high",
+                "message": f"Social-engineering phrase detected: \"{matched_phrases[0]}\"",
+                "timestamp": timestamp,
+                "keywords": matched_phrases,
+            })
+        if matched_keywords:
+            alerts.append({
+                "type": "fraud",
+                "severity": "high",
+                "message": f"Fraud keyword detected: {', '.join(matched_keywords)}",
+                "timestamp": timestamp,
+                "keywords": matched_keywords,
             })
 
         # Financial entities (informational)
@@ -351,8 +393,7 @@ async def handle_realtime_websocket(websocket: WebSocket):
                     # Run full pipeline in background
                     try:
                         from pipeline import run_full_pipeline, save_report
-                        groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-                        report = await run_full_pipeline(saved_path, groq_client, language=session.language)
+                        report = await run_full_pipeline(saved_path, language=session.language)
                         report_path = await save_report(report)
 
                         await websocket.send_json({

@@ -5,19 +5,20 @@ Full pipeline: Audio → Text Processing → Backboard Intelligence
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
+import asyncio
 import os
 import shutil
 import json
-from groq import Groq
 
 from layer1_audio import run_layer1
 from layer2_text import run_layer2, load_policy_rules
 from layer3_backboard import initialize_assistants, run_layer3
 from finbert_extractor import run_finbert_analysis, prepare_terms_for_explanation
-from pipeline import run_full_pipeline, save_report
+from pipeline import run_full_pipeline, save_report, _compute_overall_risk
 from realtime import handle_realtime_websocket
 
 # Load environment variables
@@ -43,9 +44,6 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTS = {".mp3", ".wav", ".m4a", ".mp4", ".ogg", ".flac", ".webm"}
 
-# Initialize Groq client
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
 
 # ── Startup: initialize Backboard assistants ──────────────────────────────
 
@@ -67,7 +65,7 @@ def root():
         "status": "online",
         "service": "Financial Audio Intelligence API v2",
         "layers": [
-            "Layer 1: Audio Forensics (Groq Whisper + Librosa)",
+            "Layer 1: Audio Forensics (ElevenLabs Scribe + Librosa)",
             "Layer 2: Text Processing (spaCy + PII + Profanity)",
             "Layer 3: Intelligence (Backboard.io — 4 Assistants + FinBERT)",
             "Layer 4: Review UI (Next.js)",
@@ -117,7 +115,7 @@ async def transcribe_endpoint(file: UploadFile = File(...)):
         with open(dst, "wb") as buf:
             shutil.copyfileobj(file.file, buf)
 
-        result = run_layer1(str(dst), groq_client)
+        result = run_layer1(str(dst))
         result["filename"] = safe_name
         result["status"] = "success"
         return result
@@ -180,37 +178,113 @@ async def analyze_financial_terms(body: dict):
         raise HTTPException(500, f"Term analysis failed: {e}")
 
 
-# ── Full Pipeline: Audio → L1 → L2 → L3 ──────────────────────────────────
+# ── SSE helper ─────────────────────────────────────────────────────────────
+
+def _sse(event_type: str, stage: str, message: str) -> str:
+    """Format a Server-Sent Event line."""
+    return f"data: {json.dumps({'type': event_type, 'stage': stage, 'message': message})}\n\n"
+
+
+# ── Full Pipeline: Audio → L1 → L2 → L3 (SSE streaming) ──────────────────
 
 @app.post("/analyze")
 async def full_analysis(file: UploadFile = File(...), language: str | None = None):
     """
-    FULL PIPELINE: Upload audio → Layer 1 → Layer 2 → Layer 3.
-    Returns complete compliance report.
-    Optionally specify language (e.g. 'en', 'ru', 'hi') to improve accuracy.
+    FULL PIPELINE with progress streaming via Server-Sent Events.
+    Each layer emits progress events; the final event contains the full report.
     """
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTS:
         raise HTTPException(400, f"Unsupported format: {ext}")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = f"{timestamp}_{file.filename}"
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = f"{timestamp_str}_{file.filename}"
     dst = UPLOAD_DIR / safe_name
 
-    try:
-        with open(dst, "wb") as buf:
-            shutil.copyfileobj(file.file, buf)
+    with open(dst, "wb") as buf:
+        shutil.copyfileobj(file.file, buf)
 
-        report = await run_full_pipeline(str(dst), groq_client, language=language)
+    async def event_stream():
+        try:
+            start_time = datetime.now()
 
-        # Save report
-        report_path = await save_report(report)
-        report["report_path"] = report_path
+            # ── Layer 1: Transcription + Audio Forensics ──────────────
+            yield _sse("progress", "layer1", "Layer 1: Transcribing audio with ElevenLabs Scribe & running audio forensics...")
+            layer1 = await asyncio.to_thread(run_layer1, str(dst), language)
+            transcript = layer1["transcript"]
 
-        return report
+            if not transcript or not transcript.strip() or len(transcript.strip()) < 10:
+                yield _sse("error", "", "Transcription returned too short or empty — audio may be silent, corrupted, or in an unrecognized language. Try selecting the correct language.")
+                return
 
-    except Exception as e:
-        raise HTTPException(500, f"Analysis failed: {e}")
+            if not layer1.get("segments"):
+                yield _sse("error", "", "No usable speech segments found — audio may be too noisy or the language may be incorrect. Try selecting the correct language.")
+                return
+
+            seg_count = len(layer1.get("segments", []))
+            dur = round(layer1.get("duration", 0))
+            yield _sse("progress", "layer1_done", f"Layer 1 complete — {seg_count} segments, {dur}s audio transcribed")
+
+            # ── Layer 2: Text Analysis ────────────────────────────────
+            yield _sse("progress", "layer2", "Layer 2: Scanning for PII, profanity, obligations & financial entities...")
+            detected_lang = layer1.get("language", "en")
+            layer2 = await asyncio.to_thread(run_layer2, transcript, detected_lang)
+            pii_n = layer2.get("pii_count", 0)
+            prof_n = len(layer2.get("profanity_findings", []))
+            yield _sse("progress", "layer2_done", f"Layer 2 complete — {pii_n} PII items, {prof_n} profanity findings")
+
+            # ── Layer 3: AI Compliance ────────────────────────────────
+            yield _sse("progress", "layer3", "Layer 3: Running AI compliance analysis (Backboard.io + FinBERT)...")
+            layer3 = await run_layer3(transcript, layer2)
+            yield _sse("progress", "layer3_done", "Layer 3 complete — obligations, intent, compliance & terms analyzed")
+
+            # ── Assemble Report ───────────────────────────────────────
+            yield _sse("progress", "saving", "Computing risk score & saving report...")
+            elapsed = (datetime.now() - start_time).total_seconds()
+
+            report = {
+                "status": "success",
+                "processed_at": start_time.isoformat(),
+                "processing_time_seconds": round(elapsed, 2),
+                "audio_file": Path(str(dst)).name,
+                # Layer 1
+                "transcript": transcript,
+                "language": detected_lang,
+                "duration_seconds": layer1["duration"],
+                "segments": layer1["segments"],
+                "audio_quality": layer1["audio_quality"],
+                "overall_confidence": layer1.get("overall_confidence"),
+                "emotion_analysis": layer1.get("emotion_analysis"),
+                "tamper_detection": layer1.get("tamper_detection"),
+                # Layer 2
+                "pii_detected": layer2["pii_detected"],
+                "pii_count": layer2["pii_count"],
+                "financial_entities": layer2["financial_entities"],
+                "named_entities": layer2["named_entities"],
+                "profanity_findings": layer2["profanity_findings"],
+                "obligation_sentences": layer2["obligation_sentences"],
+                "text_risk_level": layer2["risk_level"],
+                # Layer 3
+                "finbert_analysis": layer3.get("finbert_analysis"),
+                "financial_term_explanations": layer3.get("term_explanations"),
+                "obligation_analysis": layer3["obligation_analysis"],
+                "intent_classification": layer3["intent_classification"],
+                "regulatory_compliance": layer3["regulatory_compliance"],
+                # Overall
+                "overall_risk": _compute_overall_risk(layer1, layer2, layer3),
+            }
+
+            report_path = await save_report(report)
+            report["report_path"] = report_path
+
+            yield f"data: {json.dumps({'type': 'complete', 'report': report}, default=str)}\n\n"
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 # ── Get policy rules ──────────────────────────────────────────────────────
@@ -234,7 +308,7 @@ def list_reports():
     reports = []
     for f in sorted(output_dir.glob("report_*.json"), reverse=True):
         try:
-            data = json.loads(f.read_text())
+            data = json.loads(f.read_text(encoding='utf-8'))
             reports.append({
                 "filename": f.name,
                 "id": f.name,
@@ -265,7 +339,7 @@ def get_report(filename: str):
     if not filepath.exists():
         raise HTTPException(404, "Report not found")
 
-    return json.loads(filepath.read_text())
+    return json.loads(filepath.read_text(encoding='utf-8'))
 
 
 # ── WebSocket: Real-Time Analysis ──────────────────────────────────────────

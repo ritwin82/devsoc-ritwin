@@ -305,14 +305,27 @@ export async function fetchReport(id: string): Promise<Report | null> {
 }
 
 /**
- * Upload and analyze audio file through the full pipeline (L1→L2→L3)
+ * Upload and analyze audio file through the full pipeline (L1→L2→L3).
+ * Reads an SSE (Server-Sent Events) stream from the backend so the UI
+ * can display progress while each layer runs.
  */
-export async function analyzeAudio(file: File): Promise<Report | null> {
+export async function analyzeAudio(
+    file: File,
+    language?: string,
+    onProgress?: (message: string, stage: string) => void,
+): Promise<Report | null> {
     try {
         const formData = new FormData();
         formData.append("file", file);
 
-        const res = await fetch(`${API_BASE}/analyze`, {
+        const params = new URLSearchParams();
+        if (language && language !== "auto") {
+            params.set("language", language);
+        }
+        const qs = params.toString();
+        const url = `${API_BASE}/analyze${qs ? `?${qs}` : ""}`;
+
+        const res = await fetch(url, {
             method: "POST",
             body: formData,
         });
@@ -322,11 +335,50 @@ export async function analyzeAudio(file: File): Promise<Report | null> {
             throw new Error(`Analysis failed (${res.status}): ${errBody}`);
         }
 
-        const data = await res.json();
-        return mapBackendReport(data);
-    } catch (error) {
+        // Read the SSE stream
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let report: Report | null = null;
+        let buffer = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const events = buffer.split("\n\n");
+            buffer = events.pop() || ""; // last element may be incomplete
+
+            for (const event of events) {
+                const dataLine = event
+                    .split("\n")
+                    .find((line: string) => line.startsWith("data: "));
+                if (!dataLine) continue;
+
+                try {
+                    const data = JSON.parse(dataLine.slice(6));
+
+                    if (data.type === "progress" && onProgress) {
+                        onProgress(data.message, data.stage);
+                    } else if (data.type === "complete") {
+                        report = mapBackendReport(data.report);
+                    } else if (data.type === "error") {
+                        throw new Error(data.message);
+                    }
+                } catch (parseErr: any) {
+                    // If it's our own thrown error, re-throw
+                    if (parseErr.message && !parseErr.message.includes("JSON")) {
+                        throw parseErr;
+                    }
+                    console.warn("SSE parse warning:", parseErr);
+                }
+            }
+        }
+
+        return report;
+    } catch (error: any) {
         console.error("Error analyzing audio:", error);
-        return null;
+        throw error;
     }
 }
 

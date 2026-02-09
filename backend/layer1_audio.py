@@ -1,8 +1,7 @@
 """
 LAYER 1: Audio Forensics
 
-- Groq Whisper large-v3 transcription with domain vocabulary injection
-- Per-segment confidence scoring (avg_logprob → probability)
+- ElevenLabs Scribe (scribe_v2) transcription with diarization
 - Librosa audio quality analysis (SNR, clipping, silence ratio)
 - MFCC-based speaker diarization with agglomerative clustering
 - Emotion & stress markers (pitch, energy, speech rate per segment)
@@ -10,13 +9,84 @@ LAYER 1: Audio Forensics
 - Text normalization and multi-language support
 """
 
+import os
 import re
+import subprocess
+import tempfile
 from pathlib import Path
-from groq import Groq
+from io import BytesIO
+from dotenv import load_dotenv
+from elevenlabs.client import ElevenLabs
 import librosa
 import numpy as np
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.preprocessing import StandardScaler
+
+load_dotenv()
+
+
+# ── FFmpeg helper: convert unsupported formats to WAV ─────────────────────
+
+_FFMPEG_PATH: str | None = None
+
+def _get_ffmpeg() -> str:
+    """Resolve path to an FFmpeg binary (imageio-ffmpeg bundle or system)."""
+    global _FFMPEG_PATH
+    if _FFMPEG_PATH:
+        return _FFMPEG_PATH
+    # 1. Try imageio-ffmpeg bundled binary
+    try:
+        import imageio_ffmpeg
+        _FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+        return _FFMPEG_PATH
+    except Exception:
+        pass
+    # 2. Try system ffmpeg
+    import shutil
+    p = shutil.which("ffmpeg")
+    if p:
+        _FFMPEG_PATH = p
+        return _FFMPEG_PATH
+    # 3. Check project-local ffmpeg.exe
+    local = Path(__file__).parent / "ffmpeg.exe"
+    if local.exists():
+        _FFMPEG_PATH = str(local)
+        return _FFMPEG_PATH
+    raise FileNotFoundError(
+        "FFmpeg not found. Install imageio-ffmpeg (`pip install imageio-ffmpeg`) "
+        "or place ffmpeg.exe next to this file."
+    )
+
+
+def _ensure_wav(audio_path: str) -> tuple[str, bool]:
+    """
+    If *audio_path* is not a format librosa/soundfile can read natively
+    (wav, mp3, flac, ogg), convert it to a temporary 16-bit PCM WAV using
+    FFmpeg and return (wav_path, True). Otherwise return (audio_path, False).
+    The caller must delete the temp file when *created* is True.
+    """
+    ext = Path(audio_path).suffix.lower()
+    # Formats soundfile handles directly
+    NATIVE = {".wav", ".mp3", ".flac", ".ogg"}
+    if ext in NATIVE:
+        return audio_path, False
+
+    ffmpeg = _get_ffmpeg()
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-i", audio_path, "-acodec", "pcm_s16le",
+             "-ar", "16000", "-ac", "1", tmp.name],
+            check=True,
+            capture_output=True,
+        )
+        return tmp.name, True
+    except subprocess.CalledProcessError as e:
+        os.unlink(tmp.name)
+        raise RuntimeError(
+            f"FFmpeg conversion failed for {audio_path}: {e.stderr.decode(errors='replace')}"
+        ) from e
 
 
 # ── Financial Domain Vocabulary (Whisper prompt injection) ────────────────
@@ -64,103 +134,145 @@ def normalize_segment_text(text: str) -> str:
     return text
 
 
-# ── Transcription with Confidence & Domain Vocab ─────────────────────────
+# ── Language code mapping (ISO 639-1 → ISO 639-3 for ElevenLabs) ──────────
 
-def transcribe_audio(audio_path: str, groq_client: Groq, language: str | None = None) -> dict:
-    """
-    Transcribe with Groq Whisper large-v3.
-    - Injects financial domain vocabulary via prompt parameter.
-    - Extracts per-segment confidence from avg_logprob.
-    - Returns no_speech_prob and compression_ratio per segment.
-    """
-    vocab_key = language if language in FINANCIAL_VOCAB else "en"
-    domain_prompt = FINANCIAL_VOCAB.get(vocab_key, FINANCIAL_VOCAB["en"])
+LANGUAGE_CODE_MAP = {
+    "en": "eng", "ru": "rus", "hi": "hin", "es": "spa", "fr": "fra",
+    "de": "deu", "it": "ita", "pt": "por", "zh": "cmn", "ja": "jpn",
+    "ko": "kor", "ar": "ara", "nl": "nld", "pl": "pol", "tr": "tur",
+}
 
+
+# ── Transcription with ElevenLabs Scribe ──────────────────────────────────
+
+def transcribe_audio(audio_path: str, language: str | None = None) -> dict:
+    """
+    Transcribe with ElevenLabs Scribe (scribe_v2).
+    - Uses native diarization for speaker identification
+    - Tags audio events (laughter, applause, etc.)
+    - Returns segments with start/end times
+    """
+    elevenlabs_client = ElevenLabs(
+        api_key=os.getenv("ELEVENLABS_API_KEY"),
+    )
+
+    # Convert language code to ISO 639-3 format
+    lang_code = None
+    if language:
+        lang_code = LANGUAGE_CODE_MAP.get(language, language)
+        # If already 3-letter code, use as-is
+        if len(language) == 3:
+            lang_code = language
+
+    # Read audio file
     with open(audio_path, "rb") as f:
-        kwargs = {
-            "file": (Path(audio_path).name, f.read()),
-            "model": "whisper-large-v3",
-            "response_format": "verbose_json",
-            "prompt": domain_prompt,
-        }
-        if language:
-            kwargs["language"] = language
+        audio_data = BytesIO(f.read())
 
-        transcription = groq_client.audio.transcriptions.create(**kwargs)
+    # Call ElevenLabs Speech-to-Text API
+    transcription = elevenlabs_client.speech_to_text.convert(
+        file=audio_data,
+        model_id="scribe_v2",
+        tag_audio_events=True,
+        language_code=lang_code,  # None = auto-detect
+        diarize=True,  # Enable speaker diarization
+    )
 
     segments = []
-    # Known Whisper hallucination phrases (appear during silence/music)
+    full_text_parts = []
+    total_duration = 0.0
+
+    # Known hallucination phrases to filter
     HALLUCINATION_PHRASES = {
         "и т.д.", "и т.д", "продолжение следует...", "продолжение следует",
         "субтитры сделал", "subtitles by", "subscribe", "подписывайтесь",
-        "www.", "http", "...", "music", "♪",
+        "www.", "http", "...", "music", "♪", "thank you for watching",
     }
 
-    if hasattr(transcription, "segments") and transcription.segments:
-        for s in transcription.segments:
-            if isinstance(s, dict):
-                seg_text = normalize_segment_text(s.get("text", ""))
-                avg_logprob = s.get("avg_logprob", None)
-                no_speech_prob = s.get("no_speech_prob", None)
-                compression_ratio = s.get("compression_ratio", None)
-                start = s.get("start", 0)
-                end = s.get("end", 0)
+    # Process the response - ElevenLabs returns words with speaker info
+    if hasattr(transcription, "words") and transcription.words:
+        # Group words into segments by speaker and timing
+        current_segment = None
+        segment_words = []
+
+        for word in transcription.words:
+            word_text = getattr(word, "text", "") if hasattr(word, "text") else str(word.get("text", "") if isinstance(word, dict) else "")
+            word_start = getattr(word, "start", 0) if hasattr(word, "start") else (word.get("start", 0) if isinstance(word, dict) else 0)
+            word_end = getattr(word, "end", 0) if hasattr(word, "end") else (word.get("end", 0) if isinstance(word, dict) else 0)
+            word_speaker = getattr(word, "speaker_id", None) if hasattr(word, "speaker_id") else (word.get("speaker_id", None) if isinstance(word, dict) else None)
+
+            if word_end > total_duration:
+                total_duration = word_end
+
+            # Start new segment on speaker change or large gap (>1.5s)
+            if current_segment is None:
+                current_segment = {
+                    "start": word_start,
+                    "end": word_end,
+                    "speaker": word_speaker,
+                }
+                segment_words = [word_text]
+            elif word_speaker != current_segment["speaker"] or (word_start - current_segment["end"]) > 1.5:
+                # Save current segment
+                seg_text = normalize_segment_text(" ".join(segment_words))
+                if seg_text.strip() and seg_text.strip().lower() not in HALLUCINATION_PHRASES:
+                    segments.append({
+                        "start": round(current_segment["start"], 2),
+                        "end": round(current_segment["end"], 2),
+                        "text": seg_text,
+                        "confidence": None,  # ElevenLabs doesn't provide confidence scores
+                        "speaker_id": current_segment["speaker"],
+                    })
+                    full_text_parts.append(seg_text)
+
+                # Start new segment
+                current_segment = {
+                    "start": word_start,
+                    "end": word_end,
+                    "speaker": word_speaker,
+                }
+                segment_words = [word_text]
             else:
-                seg_text = normalize_segment_text(getattr(s, "text", ""))
-                avg_logprob = getattr(s, "avg_logprob", None)
-                no_speech_prob = getattr(s, "no_speech_prob", None)
-                compression_ratio = getattr(s, "compression_ratio", None)
-                start = getattr(s, "start", 0)
-                end = getattr(s, "end", 0)
+                # Continue current segment
+                current_segment["end"] = word_end
+                segment_words.append(word_text)
 
-            # ── Filter garbage segments ──
-            # 1. Drop empty text
-            if not seg_text.strip():
-                continue
-            # 2. Drop segments with very high no_speech_prob and short text
-            if no_speech_prob is not None and no_speech_prob > 0.8 and len(seg_text) < 30:
-                continue
-            # 3. Drop known Whisper hallucination phrases
-            if seg_text.strip().lower() in HALLUCINATION_PHRASES:
-                continue
-            # 4. Drop suspiciously sparse segments (>10s duration, <15 chars text)
-            duration = end - start
-            if duration > 10 and len(seg_text) < 15:
-                continue
-            # 5. Drop very low compression ratio with long duration (hallucination marker)
-            if compression_ratio is not None and compression_ratio < 0.7 and duration > 15:
-                continue
+        # Don't forget the last segment
+        if current_segment and segment_words:
+            seg_text = normalize_segment_text(" ".join(segment_words))
+            if seg_text.strip() and seg_text.strip().lower() not in HALLUCINATION_PHRASES:
+                segments.append({
+                    "start": round(current_segment["start"], 2),
+                    "end": round(current_segment["end"], 2),
+                    "text": seg_text,
+                    "confidence": None,
+                    "speaker_id": current_segment["speaker"],
+                })
+                full_text_parts.append(seg_text)
 
-            # Convert avg_logprob to confidence probability (0–1)
-            if avg_logprob is not None:
-                confidence = round(float(np.clip(np.exp(avg_logprob), 0, 1)), 3)
-            else:
-                confidence = None
+    # Fallback: if no words, try to get text directly
+    elif hasattr(transcription, "text") and transcription.text:
+        full_text = normalize_text(transcription.text)
+        full_text_parts.append(full_text)
+        segments.append({
+            "start": 0,
+            "end": total_duration,
+            "text": full_text,
+            "confidence": None,
+        })
 
-            seg = {
-                "start": round(start, 2),
-                "end": round(end, 2),
-                "text": seg_text,
-                "confidence": confidence,
-            }
-            if no_speech_prob is not None:
-                seg["no_speech_prob"] = round(float(no_speech_prob), 4)
-            if compression_ratio is not None:
-                seg["compression_ratio"] = round(float(compression_ratio), 3)
-
-            segments.append(seg)
-
-    detected_lang = getattr(transcription, "language", language or "auto")
-
-    confidences = [s["confidence"] for s in segments if s["confidence"] is not None]
-    overall_confidence = round(float(np.mean(confidences)), 3) if confidences else None
+    # Detect language from response or use provided
+    detected_lang = getattr(transcription, "language_code", None) or language or "auto"
+    # Convert back to ISO 639-1 for consistency
+    reverse_lang_map = {v: k for k, v in LANGUAGE_CODE_MAP.items()}
+    if detected_lang in reverse_lang_map:
+        detected_lang = reverse_lang_map[detected_lang]
 
     return {
-        "transcript": normalize_text(transcription.text),
+        "transcript": normalize_text(" ".join(full_text_parts)),
         "language": detected_lang,
-        "duration": getattr(transcription, "duration", None),
+        "duration": round(total_duration, 2) if total_duration > 0 else None,
         "segments": segments,
-        "overall_confidence": overall_confidence,
+        "overall_confidence": None,  # ElevenLabs doesn't provide confidence
     }
 
 
@@ -652,10 +764,10 @@ def _merge_emotions_into_segments(segments: list[dict], emotion_data: dict) -> l
 
 # ── Main Layer 1 Pipeline ────────────────────────────────────────────────
 
-def run_layer1(audio_path: str, groq_client: Groq, language: str | None = None) -> dict:
+def run_layer1(audio_path: str, language: str | None = None) -> dict:
     """
     Complete Layer 1 pipeline:
-      1. Transcribe with domain vocab injection + per-segment confidence
+      1. Transcribe with ElevenLabs Scribe (scribe_v2)
       2. Audio quality analysis
       3. MFCC-based speaker diarization (clustering)
       4. Merge speakers into transcript segments
@@ -665,35 +777,48 @@ def run_layer1(audio_path: str, groq_client: Groq, language: str | None = None) 
     Returns unified segments with:
       { start, end, text, speaker, confidence, emotion, stress_level }
     """
-    # 1. Transcription (with domain vocab + confidence scoring)
-    transcript_result = transcribe_audio(audio_path, groq_client, language=language)
+    # ── Convert to WAV if needed (m4a, webm, mp4, etc.) ───────────────
+    wav_path, was_converted = _ensure_wav(audio_path)
+    # Use the converted WAV for librosa analysis.
+    librosa_path = wav_path
 
-    # 2. Audio quality
-    quality_result = analyze_audio_quality(audio_path)
+    try:
+        # 1. Transcription — ElevenLabs handles various formats
+        transcript_result = transcribe_audio(audio_path, language=language)
 
-    # 3. Speaker diarization via MFCC clustering
-    diarization = diarize_speakers(audio_path)
+        # 2. Audio quality (librosa)
+        quality_result = analyze_audio_quality(librosa_path)
 
-    # 4. Merge speakers into transcript segments
-    merged_segments = _assign_speakers(transcript_result["segments"], diarization)
+        # 3. Speaker diarization via MFCC clustering
+        diarization = diarize_speakers(librosa_path)
 
-    # 5. Emotion & stress
-    emotion_result = analyze_emotions(audio_path, merged_segments)
+        # 4. Merge speakers into transcript segments
+        merged_segments = _assign_speakers(transcript_result["segments"], diarization)
 
-    # 6. Embed emotion labels into segments
-    merged_segments = _merge_emotions_into_segments(merged_segments, emotion_result)
+        # 5. Emotion & stress
+        emotion_result = analyze_emotions(librosa_path, merged_segments)
 
-    # 7. Tamper detection
-    tamper_result = detect_tampering(audio_path)
+        # 6. Embed emotion labels into segments
+        merged_segments = _merge_emotions_into_segments(merged_segments, emotion_result)
 
-    return {
-        "layer": "audio_forensics",
-        "transcript": transcript_result["transcript"],
-        "language": transcript_result["language"],
-        "duration": transcript_result["duration"],
-        "segments": merged_segments,
-        "audio_quality": quality_result,
-        "overall_confidence": transcript_result["overall_confidence"],
-        "emotion_analysis": emotion_result["summary"],
-        "tamper_detection": tamper_result,
-    }
+        # 7. Tamper detection
+        tamper_result = detect_tampering(librosa_path)
+
+        return {
+            "layer": "audio_forensics",
+            "transcript": transcript_result["transcript"],
+            "language": transcript_result["language"],
+            "duration": transcript_result["duration"],
+            "segments": merged_segments,
+            "audio_quality": quality_result,
+            "overall_confidence": transcript_result["overall_confidence"],
+            "emotion_analysis": emotion_result["summary"],
+            "tamper_detection": tamper_result,
+        }
+    finally:
+        # Clean up temp WAV file
+        if was_converted and os.path.exists(wav_path):
+            try:
+                os.unlink(wav_path)
+            except Exception:
+                pass

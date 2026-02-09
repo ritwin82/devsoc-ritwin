@@ -7,25 +7,24 @@ import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
-from groq import Groq
 
 from layer1_audio import run_layer1
 from layer2_text import run_layer2
 from layer3_backboard import run_layer3, initialize_assistants
 
 
-async def run_full_pipeline(audio_path: str, groq_client: Groq, language: str | None = None) -> dict:
+async def run_full_pipeline(audio_path: str, language: str | None = None) -> dict:
     """
     Execute the full 3-layer analysis pipeline on an audio file.
 
-    Layer 1: Audio Forensics  (Groq Whisper + Librosa)
+    Layer 1: Audio Forensics  (ElevenLabs Scribe + Librosa)
     Layer 2: Text Processing  (spaCy + Regex + PII)
     Layer 3: Intelligence     (Backboard assistants)
     """
     start_time = datetime.now()
 
     # ── Layer 1: Audio Forensics ──────────────────────────────────────
-    layer1 = run_layer1(audio_path, groq_client, language=language)
+    layer1 = run_layer1(audio_path, language=language)
     transcript = layer1["transcript"]
 
     if not transcript or not transcript.strip():
