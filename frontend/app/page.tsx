@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { fetchReports, analyzeAudio } from "@/lib/api";
+import { fetchReports } from "@/lib/api";
 import AudioUpload from "@/components/AudioUpload";
 import type { Report } from "@/lib/api";
 
@@ -26,13 +26,15 @@ export default function Home() {
     loadReports();
   }, []);
 
-  const handleAudioAnalyzed = (file: File) => {
-    setIsAnalyzing(true);
-    // In a real app, you'd call analyzeAudio here
-    // For now, just reload reports after a delay
-    setTimeout(() => {
-      window.location.reload();
-    }, 2000);
+  const handleAudioAnalyzed = async (report: Report) => {
+    // Report already analyzed by AudioUpload component — just refresh the list
+    setIsAnalyzing(false);
+    try {
+      const data = await fetchReports();
+      setReports(data);
+    } catch (err) {
+      console.error("Failed to refresh reports:", err);
+    }
   };
 
   const avgRiskScore =

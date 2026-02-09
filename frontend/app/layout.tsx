@@ -47,6 +47,12 @@ export default function RootLayout({
               >
                 Reports
               </Link>
+              <Link
+                href="/realtime"
+                className="text-gray-300 hover:text-white transition-colors"
+              >
+                Real-Time
+              </Link>
             </div>
           </div>
         </nav>

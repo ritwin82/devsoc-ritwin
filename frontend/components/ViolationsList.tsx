@@ -54,7 +54,7 @@ export default function ViolationsList({ violations }: ViolationsListProps) {
                     Violations ({normalizedViolations.length})
                 </h3>
             </div>
-            <div className="divide-y divide-gray-700 max-h-[400px] overflow-y-auto">
+            <div className="divide-y divide-gray-700 max-h-100 overflow-y-auto">
                 {normalizedViolations.map((violation, idx) => (
                     <div
                         key={idx}

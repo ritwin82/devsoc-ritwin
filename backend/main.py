@@ -3,7 +3,7 @@ Financial Audio Intelligence API
 Full pipeline: Audio → Text Processing → Backboard Intelligence
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 from datetime import datetime
@@ -18,6 +18,7 @@ from layer2_text import run_layer2, load_policy_rules
 from layer3_backboard import initialize_assistants, run_layer3
 from finbert_extractor import run_finbert_analysis, prepare_terms_for_explanation
 from pipeline import run_full_pipeline, save_report
+from realtime import handle_realtime_websocket
 
 # Load environment variables
 load_dotenv()
@@ -265,6 +266,14 @@ def get_report(filename: str):
         raise HTTPException(404, "Report not found")
 
     return json.loads(filepath.read_text())
+
+
+# ── WebSocket: Real-Time Analysis ──────────────────────────────────────────
+
+@app.websocket("/ws/realtime")
+async def realtime_ws(websocket: WebSocket):
+    """WebSocket endpoint for real-time call analysis."""
+    await handle_realtime_websocket(websocket)
 
 
 # ── Run ────────────────────────────────────────────────────────────────────

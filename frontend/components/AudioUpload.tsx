@@ -2,9 +2,10 @@
 
 import React, { useState } from "react";
 import { analyzeAudio } from "@/lib/api";
+import type { Report } from "@/lib/api";
 
 interface AudioUploadProps {
-  onAnalyzed?: (file: File) => void;
+  onAnalyzed?: (report: Report) => void;
 }
 
 export default function AudioUpload({ onAnalyzed }: AudioUploadProps) {
@@ -48,15 +49,15 @@ export default function AudioUpload({ onAnalyzed }: AudioUploadProps) {
         });
         setFile(null);
 
-        // Call callback if provided
+        // Call callback with the full report
         if (onAnalyzed) {
-          onAnalyzed(file);
+          onAnalyzed(result);
         }
 
-        // Reset after 2 seconds
+        // Reset message after 3 seconds
         setTimeout(() => {
           setMessage(null);
-        }, 2000);
+        }, 3000);
       } else {
         setMessage({
           type: "error",
