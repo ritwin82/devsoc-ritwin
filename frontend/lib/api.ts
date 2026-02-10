@@ -478,3 +478,60 @@ export async function fetchAnalyticsTrends(): Promise<AnalyticsTrends | null> {
         return null;
     }
 }
+
+
+// ── Layer 6: Query Bot API ───────────────────────────────────────────────
+
+export interface QueryResponse {
+    status: string;
+    answer: string;
+    data_context: {
+        total_calls: number;
+        data_source: string;
+    };
+    session_id: string | null;
+}
+
+export interface QuerySuggestion {
+    text: string;
+    category: string;
+}
+
+/**
+ * Send a natural language query to Layer 6 Query Bot
+ */
+export async function sendQuery(question: string, sessionId?: string): Promise<QueryResponse | null> {
+    try {
+        const res = await fetch(`${API_BASE}/query`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                question,
+                session_id: sessionId || null,
+            }),
+        });
+        if (!res.ok) {
+            const errBody = await res.text();
+            throw new Error(`Query failed (${res.status}): ${errBody}`);
+        }
+        return await res.json();
+    } catch (error) {
+        console.error("Error sending query:", error);
+        throw error;
+    }
+}
+
+/**
+ * Fetch suggested questions for the query bot
+ */
+export async function fetchQuerySuggestions(): Promise<QuerySuggestion[]> {
+    try {
+        const res = await fetch(`${API_BASE}/query/suggestions`);
+        if (!res.ok) throw new Error(`Failed to fetch suggestions: ${res.status}`);
+        const data = await res.json();
+        return data.suggestions || [];
+    } catch (error) {
+        console.error("Error fetching query suggestions:", error);
+        return [];
+    }
+}

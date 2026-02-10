@@ -53,6 +53,12 @@ export default function RootLayout({
               >
                 Real-Time
               </Link>
+              <Link
+                href="/query"
+                className="text-gray-300 hover:text-white transition-colors"
+              >
+                Query Bot
+              </Link>
             </div>
           </div>
         </nav>

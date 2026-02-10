@@ -25,14 +25,17 @@ from layer5_data_export import (
     get_batch_processor, compute_analytics, compute_trends,
     export_all_reports_csv, MIN_BATCH_SIZE, EXPORTS_DIR
 )
+from layer6_querybot import (
+    handle_query, get_suggested_questions, initialize_query_assistant
+)
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI(
     title="Financial Audio Intelligence API",
-    version="2.1.0",
-    description="4-Layer compliance analysis for financial service call recordings with FinBERT-powered term extraction",
+    version="3.0.0",
+    description="6-Layer compliance analysis for financial service call recordings with FinBERT-powered term extraction and NL query bot",
 )
 
 app.add_middleware(
@@ -60,6 +63,10 @@ async def startup():
         print("✓ Backboard assistants initialized")
     except Exception as e:
         print(f"⚠ Backboard init deferred: {e}")
+    try:
+        await initialize_query_assistant()
+    except Exception as e:
+        print(f"⚠ Layer 6 Query Bot init deferred: {e}")
 
 
 # ── Health ────────────────────────────────────────────────────────────────
@@ -74,6 +81,8 @@ def root():
             "Layer 2: Text Processing (spaCy + PII + Profanity)",
             "Layer 3: Intelligence (Backboard.io — 4 Assistants + FinBERT)",
             "Layer 4: Review UI (Next.js)",
+            "Layer 5: Data Export & Analytics (CSV + Batch)",
+            "Layer 6: Query Bot (Natural Language Analytics)",
         ],
         "timestamp": datetime.now().isoformat(),
     }
@@ -505,6 +514,48 @@ async def analytics_trends():
     Shows compliance and risk scores over time.
     """
     return compute_trends()
+
+
+# ── Layer 6: Natural Language Query Bot ────────────────────────────────────
+
+@app.post("/query")
+async def query_bot(body: dict):
+    """
+    Layer 6: Ask questions about your call analysis data in natural language.
+    
+    Input: {"question": "How many calls have high risk?", "session_id": "optional-session-id"}
+    
+    Returns:
+    - answer: Natural language response with data insights
+    - data_context: Summary of data used to generate the answer
+    """
+    question = body.get("question", "").strip()
+    if not question:
+        raise HTTPException(400, "No question provided")
+    
+    session_id = body.get("session_id")
+    
+    try:
+        result = await handle_query(question, session_id=session_id)
+        return {
+            "status": "success",
+            **result,
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Query failed: {str(e)}")
+
+
+@app.get("/query/suggestions")
+async def query_suggestions():
+    """
+    Get suggested questions for the query bot.
+    Returns a list of example questions users can ask.
+    """
+    return {
+        "suggestions": get_suggested_questions(),
+    }
 
 
 # ── Run ────────────────────────────────────────────────────────────────────
